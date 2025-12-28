@@ -1,1 +1,1288 @@
 
+//=========================================================
+//EE273 UVM Project========================================
+//	===============================================
+// ========================================================
+// UVM Testbench for I2C Master with APB Slave Access======
+// ========================================================
+//=========================================================
+
+`timescale 1ns/10ps
+
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+`include "/home/018218694@SJSUAD.SJSU.EDU/proj25/proj/i2c4.sv"
+
+//`define RESET
+//`define READ_WRITE
+//`define REPEATED_START
+//`define INTERRUPT
+//`define VALID_SLAVE_ADDR
+
+
+//-----------------------------------------------------
+// APB Interface (Slave)
+//-----------------------------------------------------
+interface apb_if;
+  logic PCLK;
+  logic PRESET;
+  logic [4:0] PADDR;
+  logic PSEL;
+  logic PENABLE;
+  logic PWRITE;
+  logic [31:0] PWDATA;
+  logic [31:0] PRDATA;
+  logic PREADY;
+  logic PSLVERR;
+endinterface : apb_if
+
+//-----------------------------------------------------
+// I2C Interface (Master)
+//-----------------------------------------------------
+interface i2c_if;
+  logic Interrupt;
+  logic SCL_drive;
+  logic SCL_result;
+  logic SDA_drive;
+  logic SDA_result;
+endinterface : i2c_if
+
+//-----------------------------------------------------
+// Sequence Item
+//-----------------------------------------------------
+class apb_seq_item extends uvm_sequence_item;
+  rand bit [4:0] addr;
+  rand bit [31:0] data;
+  rand bit write;
+
+  `uvm_object_utils(apb_seq_item)
+  constraint valid_addr_range { addr inside {5'h00, 5'h04, 5'h08, 5'h0C, 5'h10}; }
+  constraint valid_data_width { data[31:8] == 0; } // Only LSB 8 bits are used
+
+
+  function new(string name = "apb_seq_item");
+    super.new(name);
+  endfunction
+
+  function void do_print(uvm_printer printer);
+    super.do_print(printer);
+    printer.print_field_int("addr", addr, 5);
+    printer.print_field_int("data", data, 32);
+    printer.print_field_int("write", write, 1);
+  endfunction
+endclass : apb_seq_item
+
+
+//-----------------------------------------------------
+// I2C Reset Sequence; APB reset has been tested in top
+//module
+//Feature: Software reset: An internal reset for the whole
+//I2C (except for I2C_IADR and I2C_IFDR registers)
+//initiated by deasserting the I2C_I2CR[IEN] bit
+//-----------------------------------------------------
+class i2c_rst_seq extends uvm_sequence #(apb_seq_item);
+  `uvm_object_utils(i2c_rst_seq)
+
+  // Timeout counter for handling delays in interrupt response
+  int timeout;
+
+  // Virtual interfaces for protocol-accurate delays
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  function new(string name = "apb_read_write_seq");
+    super.new(name);
+  endfunction
+
+  task pre_body();
+    if (!uvm_config_db#(virtual apb_if)::get(null, "*", "apb_vif", apb_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get apb_vif from config DB")
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(null, "*", "i2c_vif", i2c_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get i2c_vif from config DB")
+    end
+  endtask
+
+  // Main body task implementing the I2C operation FSM
+  task body;
+    apb_seq_item req;
+    $display("------------------------------------------------");
+    $display("-------------Running Reset Sequence-------------");
+    $display("------------------------------------------------");
+
+    req = apb_seq_item::type_id::create("ifdr_write");
+    req.addr = 5'h04; // IFDR
+    req.data = 32'h2;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    req = apb_seq_item::type_id::create("iadr_write");
+    req.addr = 5'h00; // IADR
+    req.data = 32'h74;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    req = apb_seq_item::type_id::create("data_write");
+    req.addr = 5'h10; // IDR
+    req.data = 32'h55;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    //Assert IEN bit to check reset condition inside I2C.
+    req = apb_seq_item::type_id::create("control_reg_write");
+    req.addr = 5'h08; // ICR
+    req.data = 32'h80;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    //Deassert IEN bit
+    req = apb_seq_item::type_id::create("ifdr_write");
+    req.addr = 5'h08; // IFDR
+    req.data = 32'h00;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    //Now, read all registers, other than frequency and address register all, reg values should be reset.
+    req = apb_seq_item::type_id::create("addr_reg_read");
+    req.addr = 5'h00; //Address reg
+    req.write = 0;
+    start_item(req); finish_item(req);
+
+    //Now, read all registers, other than frequency and address register all, reg values should be reset.
+    req = apb_seq_item::type_id::create("freq_reg_read");
+    req.addr = 5'h04; // freq div
+    req.write = 0;
+    start_item(req); finish_item(req);
+
+    //Now, read all registers, other than frequency and address register all, reg values should be reset.
+    req = apb_seq_item::type_id::create("control_reg_read");
+    req.addr = 5'h08; // ICR
+    req.write = 0;
+    start_item(req); finish_item(req);
+
+    //Now, read all registers, other than frequency and address register all, reg values should be reset.
+    req = apb_seq_item::type_id::create("data_reg_read");
+    req.addr = 5'h10; // ICR
+    req.write = 0;
+    start_item(req); finish_item(req);
+
+  endtask : body
+endclass : i2c_rst_seq
+
+
+//-----------------------------------------------------
+// READ WRITE Sequence
+//-----------------------------------------------------
+class apb_read_write_seq extends uvm_sequence #(apb_seq_item);
+  `uvm_object_utils(apb_read_write_seq)
+
+  // FSM state type declaration
+  typedef enum {ENTER, ENABLE, START, SEND_DATA, INTERRUPT, TX_COMPLETE, STOP, DISABLE, ERROR_HANDLER, EXIT} state_t;
+
+  // FSM state variables
+  state_t curr_state, next_state;
+
+  // Timeout counter for handling delays in interrupt response
+  int timeout;
+
+  // Virtual interfaces for protocol-accurate delays
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  function new(string name = "apb_read_write_seq");
+    super.new(name);
+  endfunction
+
+  task pre_body();
+    if (!uvm_config_db#(virtual apb_if)::get(null, "*", "apb_vif", apb_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get apb_vif from config DB")
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(null, "*", "i2c_vif", i2c_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get i2c_vif from config DB")
+    end
+  endtask
+
+  // Main body task implementing the I2C operation FSM
+  task body;
+    apb_seq_item req;
+    curr_state = ENTER;
+    next_state = ENTER;
+    timeout = 0;
+
+    $display("------------------------------------------------");
+    $display("-----------Running Read Write Sequence----------");
+    $display("------------------------------------------------");
+    forever begin
+      // Begin FSM
+      case (curr_state)
+
+        ENTER: begin
+          `uvm_info("SEQ", "State: ENTER", UVM_MEDIUM)
+          next_state = ENABLE;
+        end
+
+        ENABLE: begin
+          req = apb_seq_item::type_id::create("ifdr_write");
+          req.addr = 5'h04; // IFDR
+          req.data = 32'h2;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          req = apb_seq_item::type_id::create("iadr_write");
+          req.addr = 5'h00; // IADR
+          req.data = 32'h0000001C;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          req = apb_seq_item::type_id::create("i2cr_enable");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000C0;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          next_state = START;
+        end
+
+        START: begin
+          req = apb_seq_item::type_id::create("i2cr_start");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000F0; // START + MTX + IEN + IIEN
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+          next_state = SEND_DATA;
+        end
+
+        SEND_DATA: begin
+          req = apb_seq_item::type_id::create("data_write");
+          req.addr = 5'h10; // I2DR
+          req.data = 32'h0000005F; // some data
+          req.write = 1;
+          start_item(req); finish_item(req);
+          wait (i2c_vif.SDA_result === 1'b0);
+          wait (i2c_vif.SDA_result === 1'b1);
+          req = apb_seq_item::type_id::create("sr_read");
+          req.addr = 5'h0C; // I2SR
+          req.data = 32'h0; // dummy
+          req.write = 0;
+          start_item(req); finish_item(req);
+
+          timeout++;
+          next_state = STOP;
+        end
+
+        STOP: begin
+          req = apb_seq_item::type_id::create("i2cr_stop");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000C0; // clear MSTA
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+
+          next_state = DISABLE;
+        end
+
+        DISABLE: begin
+          req = apb_seq_item::type_id::create("i2cr_disable");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h00000000;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+          next_state = EXIT;
+        end
+
+        ERROR_HANDLER: begin
+          `uvm_error("SEQ", "FSM entered ERROR_HANDLER state")
+          req = apb_seq_item::type_id::create("i2cr_force_disable");
+          req.addr = 5'h08;
+          req.data = 32'h00000000;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+
+          next_state = EXIT;
+        end
+
+        EXIT: begin
+          `uvm_info("SEQ", "State: EXIT", UVM_MEDIUM)
+          break;
+        end
+
+      endcase
+      // Update current state for the next cycle
+      curr_state = next_state;
+      // Small delay to simulate realistic transition timing
+      repeat (10) @(posedge apb_vif.PCLK);
+    end
+  endtask : body
+endclass : apb_read_write_seq
+
+
+//-----------------------------------------------------
+// REPEATED START Sequence
+//-----------------------------------------------------
+class apb_repeated_start_seq extends uvm_sequence #(apb_seq_item);
+  `uvm_object_utils(apb_repeated_start_seq)
+
+  // FSM state type declaration
+  typedef enum {ENTER, ENABLE, START, SEND_DATA, INTERRUPT, TX_COMPLETE, STOP, DISABLE, ERROR_HANDLER, EXIT} state_t;
+
+  // FSM state variables
+  state_t curr_state, next_state;
+
+  // Timeout counter for handling delays in interrupt response
+  int timeout;
+
+  // Virtual interfaces for protocol-accurate delays
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  function new(string name = "apb_repeated_start_seq");
+    super.new(name);
+  endfunction
+
+  task pre_body();
+    if (!uvm_config_db#(virtual apb_if)::get(null, "*", "apb_vif", apb_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get apb_vif from config DB")
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(null, "*", "i2c_vif", i2c_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get i2c_vif from config DB")
+    end
+  endtask
+
+  // Main body task implementing the I2C operation FSM
+  task body;
+    apb_seq_item req;
+    curr_state = ENTER;
+    next_state = ENTER;
+    timeout = 0;
+
+    $display("------------------------------------------------");
+    $display("--------Running Repeated Start Sequence---------");
+    $display("------------------------------------------------");
+    forever begin
+      // Begin FSM
+      case (curr_state)
+
+        ENTER: begin
+          `uvm_info("SEQ", "State: ENTER", UVM_MEDIUM)
+          next_state = ENABLE;
+        end
+
+        ENABLE: begin
+          req = apb_seq_item::type_id::create("ifdr_write");
+          req.addr = 5'h04; // IFDR
+          req.data = 32'h2;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          req = apb_seq_item::type_id::create("iadr_write");
+          req.addr = 5'h00; // IADR
+          req.data = 32'h0000001C;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          req = apb_seq_item::type_id::create("i2cr_enable");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000C0;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          next_state = START;
+        end
+
+        START: begin
+          req = apb_seq_item::type_id::create("i2cr_start");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000F0; // START + MTX + IEN + IIEN
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+          next_state = SEND_DATA;
+        end
+
+        SEND_DATA: begin
+          req = apb_seq_item::type_id::create("data_write");
+          req.addr = 5'h10; // I2DR
+          req.data = 32'h0000005F; // some data
+          req.write = 1;
+          start_item(req); finish_item(req);
+          //Wait for acknowledgement
+          wait (i2c_vif.SDA_result === 1'b0);
+          wait (i2c_vif.SDA_result === 1'b1);
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000F4;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          //Send data again for repeated start condition
+          $display("Sending another byte of data.");
+          req.addr = 5'h10; // I2DR
+          req.data = 32'h000000AA; // some data
+          req.write = 1;
+          start_item(req); finish_item(req);
+          req.addr = 5'h10; // I2DR
+          //Wait for acknowledgement
+          wait (i2c_vif.SDA_result === 1'b0);
+          wait (i2c_vif.SDA_result === 1'b1);
+
+          //Send data again for repeated start condition
+          $display("Sending another byte of data.");
+          req.addr = 5'h10; // I2DR
+          req.data = 32'h00000076; // some data
+          req.write = 1;
+          start_item(req); finish_item(req);
+          req.addr = 5'h10; // I2DR
+          //Wait for acknowledgement
+          wait (i2c_vif.SDA_result === 1'b0);
+          wait (i2c_vif.SDA_result === 1'b1);
+
+          //Send data again for repeated start condition
+          $display("Sending another byte of data.");
+          req.addr = 5'h10; // I2DR
+          req.data = 32'h00000089; // some data
+          req.write = 1;
+          start_item(req); finish_item(req);
+          req.addr = 5'h10; // I2DR
+          //Wait for acknowledgement
+          wait (i2c_vif.SDA_result === 1'b0);
+          wait (i2c_vif.SDA_result === 1'b1);
+
+          req.addr = 5'hC; // I2DR
+          req.write = 0;
+          start_item(req); finish_item(req);
+          //timeout++;
+          next_state = STOP;
+        end
+
+        STOP: begin
+          req = apb_seq_item::type_id::create("i2cr_stop");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000C0; // clear MSTA
+          req.write = 1;
+          start_item(req); finish_item(req);
+          next_state = DISABLE;
+        end
+
+        DISABLE: begin
+          req = apb_seq_item::type_id::create("i2cr_disable");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h00000000;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (30) @(posedge apb_vif.PCLK); // for APB delays
+          next_state = EXIT;
+        end
+
+        ERROR_HANDLER: begin
+          `uvm_error("SEQ", "FSM entered ERROR_HANDLER state")
+          req = apb_seq_item::type_id::create("i2cr_force_disable");
+          req.addr = 5'h08;
+          req.data = 32'h00000000;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (30) @(posedge apb_vif.PCLK); // for APB delays
+
+          next_state = EXIT;
+        end
+
+        EXIT: begin
+          `uvm_info("SEQ", "State: EXIT", UVM_MEDIUM)
+          break;
+        end
+
+      endcase
+      // Update current state for the next cycle
+      curr_state = next_state;
+      // Small delay to simulate realistic transition timing
+      repeat (10) @(posedge apb_vif.PCLK);
+    end
+  endtask : body
+endclass : apb_repeated_start_seq
+
+
+
+//-----------------------------------------------------
+// Valid Slave ADDR  Sequence
+//Check for boundary slave addresses ie. 'h0 and 'h7F
+//-----------------------------------------------------
+class  valid_slave_boundary_addr_seq extends uvm_sequence #(apb_seq_item);
+  `uvm_object_utils( valid_slave_boundary_addr_seq)
+
+  // Register structures
+  CR cr;
+  DR dr;
+  SR sr;
+  IADR adr;
+
+  // Virtual interfaces for protocol-accurate delays
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  function new(string name = "apb_repeated_start_seq");
+    super.new(name);
+  endfunction
+
+  task pre_body();
+    if (!uvm_config_db#(virtual apb_if)::get(null, "*", "apb_vif", apb_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get apb_vif from config DB")
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(null, "*", "i2c_vif", i2c_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get i2c_vif from config DB")
+    end
+  endtask
+
+  // Main body task implementing the I2C operation FSM
+  task body;
+    apb_seq_item req;
+    $display("------------------------------------------------");
+    $display("------Running Boundary Slave Address Sequence------");
+    $display("------------------------------------------------");
+
+    $display("Programming 'h0 Slave Address.");
+
+    req = apb_seq_item::type_id::create("ifdr_write");
+    req.addr = 5'h04; // IFDR
+    req.data = 32'h2;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    req = apb_seq_item::type_id::create("iadr_write");
+    req.addr = 5'h00; // IADR
+    req.data = 32'h00000;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    req = apb_seq_item::type_id::create("i2cr_start");
+    req.addr = 5'h08; // I2CR
+    req.data = 32'h000000F0; // START + MTX + IEN + IIEN
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+
+    req = apb_seq_item::type_id::create("data_write");
+    req.addr = 5'h10; // I2DR
+    req.data = 32'h000000AA; // some data
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    $display("Programming 'h7F Slave Address.");
+
+    repeat (350) @(posedge apb_vif.PCLK); // for APB delays
+
+    req = apb_seq_item::type_id::create("ifdr_write");
+    req.addr = 5'h04; // IFDR
+    req.data = 32'h2;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    req = apb_seq_item::type_id::create("iadr_write");
+    req.addr = 5'h00; // IADR
+    req.data = 32'h0000007F;
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    req = apb_seq_item::type_id::create("i2cr_start");
+    req.addr = 5'h08; // I2CR
+    req.data = 32'h000000F0; // START + MTX + IEN + IIEN
+    req.write = 1;
+    start_item(req); finish_item(req);
+
+    repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+
+    req = apb_seq_item::type_id::create("data_write");
+    req.addr = 5'h10; // I2DR
+    req.data = 32'h00000055; // some data
+    req.write = 1;
+    start_item(req); finish_item(req);
+    repeat (350) @(posedge apb_vif.PCLK); // for APB delays
+
+  endtask : body
+endclass : valid_slave_boundary_addr_seq
+
+
+//-----------------------------------------------------
+// Interrupt handler Sequence
+//-----------------------------------------------------
+class i2c_interrupt_seq extends uvm_sequence #(apb_seq_item);
+  `uvm_object_utils(i2c_interrupt_seq)
+
+  // FSM state type declaration
+  typedef enum {ENTER, ENABLE, START, SEND_DATA, INTERRUPT, TX_COMPLETE, STOP, DISABLE, ERROR_HANDLER, EXIT} state_t;
+
+  // Register structures
+  CR cr;
+  DR dr;
+  SR sr;
+  IADR adr;
+
+  // FSM state variables
+  state_t curr_state, next_state;
+
+  // Timeout counter for handling delays in interrupt response
+  int timeout;
+
+  // Virtual interfaces for protocol-accurate delays
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  function new(string name = "apb_repeated_start_seq");
+    super.new(name);
+  endfunction
+
+  task pre_body();
+    if (!uvm_config_db#(virtual apb_if)::get(null, "*", "apb_vif", apb_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get apb_vif from config DB")
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(null, "*", "i2c_vif", i2c_vif)) begin
+      `uvm_fatal("SEQCFG", "Could not get i2c_vif from config DB")
+    end
+  endtask
+
+  // Main body task implementing the I2C operation FSM
+  task body;
+    apb_seq_item req;
+    curr_state = ENTER;
+    next_state = ENTER;
+    timeout = 0;
+
+    $display("------------------------------------------------");
+    $display("------Running Interrupt Handler Sequence--------");
+    $display("------------------------------------------------");
+    forever begin
+      // Begin FSM
+      case (curr_state)
+
+        ENTER: begin
+          `uvm_info("SEQ", "State: ENTER", UVM_MEDIUM)
+          next_state = ENABLE;
+        end
+
+        ENABLE: begin
+          req = apb_seq_item::type_id::create("ifdr_write");
+          req.addr = 5'h04; // IFDR
+          req.data = 32'h2;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          req = apb_seq_item::type_id::create("iadr_write");
+          req.addr = 5'h00; // IADR
+          req.data = 32'h0000001C;
+          req.write = 1;
+          start_item(req); finish_item(req);
+
+          req = apb_seq_item::type_id::create("i2cr_enable");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000C0;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          next_state = START;
+        end
+
+        START: begin
+          req = apb_seq_item::type_id::create("i2cr_start");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000F0; // START + MTX + IEN + IIEN
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+          next_state = SEND_DATA;
+        end
+
+        SEND_DATA: begin
+          req = apb_seq_item::type_id::create("data_write");
+          req.addr = 5'h10; // I2DR
+          req.data = 32'h0000005F; // some data
+          req.write = 1;
+          start_item(req); finish_item(req);
+          //Wait for acknowledgement
+          wait (i2c_vif.SDA_result === 1'b0);
+          //wait (i2c_vif.SDA_result === 1'b1);
+          //next_state = TX_COMPLETE;
+
+          req.addr = 5'h0C; // I2CR
+          req.write = 0;
+          start_item(req); finish_item(req);
+          if (sr.IIF) begin
+            $display("[FSM] ERROR: Arbitration Lost.");
+            next_state = INTERRUPT;
+          end else if (timeout > 100) begin
+            $display("[FSM] TIMEOUT waiting for IIF.");
+            next_state = ERROR_HANDLER;
+          end else begin
+            $display("[FSM] TX Success. Interrupt acknowledged.");
+            next_state = TX_COMPLETE;
+          end
+        end
+
+        //Not getting IIF='h1 from DUT.
+
+        INTERRUPT: begin
+          /*timeout++;
+          apb_read(5'h0C, read_val);
+          sr = SR'(read_val[7:0]);
+          if (sr.IIF) begin
+            $display("[FSM] ERROR: Arbitration Lost.");
+            next_state = ERROR_HANDLER;
+          end else if (sr.RXAK) begin
+            $display("[FSM] ERROR: No ACK Received.");
+            next_state = ERROR_HANDLER;
+          end else begin
+            $display("[FSM] TX Success. Interrupt acknowledged.");
+            next_state = STOP;
+          end*/
+          next_state = TX_COMPLETE;
+        end
+
+
+        TX_COMPLETE: begin
+          /*$display("[FSM] TX Complete State");
+          wait_clock_cycles("PCLK", 20);
+          apb_read(5'h0C, read_val);
+          sr = SR'(read_val[7:0]);
+          if (sr.RXAK == 1) begin
+            next_state = ERROR_HANDLER;
+          end
+          //else if(sr.RXAK == 0) begin
+          //next_state = SEND_DATA;
+          //end
+          else begin
+            next_state = STOP;
+          end*/
+          next_state = STOP;
+        end
+
+        STOP: begin
+          req = apb_seq_item::type_id::create("i2cr_stop");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h000000C0; // clear MSTA
+          req.write = 1;
+          start_item(req); finish_item(req);
+          next_state = DISABLE;
+        end
+
+        DISABLE: begin
+          req = apb_seq_item::type_id::create("i2cr_disable");
+          req.addr = 5'h08; // I2CR
+          req.data = 32'h00000000;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+          next_state = EXIT;
+        end
+
+        ERROR_HANDLER: begin
+          `uvm_error("SEQ", "FSM entered ERROR_HANDLER state")
+          req = apb_seq_item::type_id::create("i2cr_force_disable");
+          req.addr = 5'h08;
+          req.data = 32'h00000000;
+          req.write = 1;
+          start_item(req); finish_item(req);
+          repeat (20) @(posedge apb_vif.PCLK); // for APB delays
+
+          next_state = EXIT;
+        end
+
+        EXIT: begin
+          `uvm_info("SEQ", "State: EXIT", UVM_MEDIUM)
+          break;
+        end
+
+      endcase
+      // Update current state for the next cycle
+      curr_state = next_state;
+      // Small delay to simulate realistic transition timing
+      repeat (10) @(posedge apb_vif.PCLK);
+    end
+  endtask : body
+endclass : i2c_interrupt_seq
+
+//-----------------------------------------------------
+// Sequencer
+//-----------------------------------------------------
+class apb_sequencer extends uvm_sequencer #(apb_seq_item);
+  `uvm_component_utils(apb_sequencer)
+
+  function new(string name = "apb_sequencer", uvm_component parent);
+    super.new(name, parent);
+  endfunction
+endclass : apb_sequencer
+
+//-----------------------------------------------------
+// Driver
+//-----------------------------------------------------
+class apb_driver extends uvm_driver #(apb_seq_item);
+  virtual apb_if vif;
+  apb_seq_item tr;
+  uvm_analysis_port#(apb_seq_item) apb_ap;
+
+  `uvm_component_utils(apb_driver)
+
+  function new(string name = "apb_driver", uvm_component parent);
+    super.new(name, parent);
+    apb_ap = new("apb_ap", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    if (vif == null) begin
+      `uvm_fatal("NULL_APB_VIF", "APB virtual interface is NULL")
+    end
+
+    forever begin
+      seq_item_port.get_next_item(tr);
+
+      vif.PADDR   <= tr.addr;
+      vif.PWDATA  <= tr.data;
+      vif.PWRITE  <= tr.write;
+      vif.PSEL    <= 1;
+      @(posedge vif.PCLK);
+      vif.PENABLE <= 1;
+      @(posedge vif.PCLK);
+      vif.PSEL    <= 0;
+      vif.PENABLE <= 0;
+
+      seq_item_port.item_done();
+      apb_ap.write(tr);
+
+      // Capture PRDATA for read operations
+      if (!tr.write) begin
+        tr.data = vif.PRDATA;
+      end
+    end
+  endtask
+endclass : apb_driver
+
+//-----------------------------------------------------
+// Combined I2C and APB Monitor with Interrupt Handling
+//-----------------------------------------------------
+class i2c_combined_monitor extends uvm_monitor;
+  virtual apb_if apb_vif;  // APB interface
+  virtual i2c_if i2c_vif;  // I2C interface
+
+  // Analysis port to send observed transactions
+  uvm_analysis_port#(apb_seq_item) apb_ap;
+
+  // Variables for I2C data capture
+  bit [7:0] data_byte;
+  int bit_count = 0;
+  bit waiting_for_ack = 0;
+
+  // Structure for I2C Status Register (I2SR) fields
+  typedef struct {
+    bit IIF;   // Interrupt Flag (bit 7)
+    bit RXAK;  // Received Acknowledge (0 = ACK, 1 = NACK) (bit 0)
+    bit IAL;   // Arbitration Lost (bit 4)
+    bit [4:0] reserved; // Other bits (assuming 8-bit I2SR)
+  } i2c_sr_t;
+
+  `uvm_component_utils(i2c_combined_monitor)
+
+  // Constructor
+  function new(string name = "i2c_combined_monitor", uvm_component parent);
+    super.new(name, parent);
+    apb_ap = new("apb_ap", this);
+  endfunction
+
+  // Build phase to check interface availability
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual apb_if)::get(this, "", "apb_vif", apb_vif)) begin
+      `uvm_fatal("NOVIF", "APB virtual interface not set for monitor")
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(this, "", "i2c_vif", i2c_vif)) begin
+      `uvm_fatal("NOVIF", "I2C virtual interface not set for monitor")
+    end
+  endfunction
+
+  // Run phase to monitor APB, I2C, and interrupts
+  task run_phase(uvm_phase phase);
+    `ifdef READ_WRITE
+    fork
+      // APB Monitoring Task
+      monitor_apb();
+      // I2C Monitoring Task
+      monitor_i2c();
+      // Interrupt Handling Task
+      monitor_interrupts();
+    join
+    `endif
+  endtask
+
+  // Task to monitor APB transactions
+  task monitor_apb();
+    apb_seq_item observed;
+    forever begin
+      @(posedge apb_vif.PCLK);
+      if (apb_vif.PSEL && apb_vif.PENABLE && apb_vif.PREADY) begin
+        observed = apb_seq_item::type_id::create("observed", this);
+        observed.addr = apb_vif.PADDR;
+        observed.write = apb_vif.PWRITE;
+        observed.data = apb_vif.PWRITE ? apb_vif.PWDATA : apb_vif.PRDATA;
+        if (apb_vif.PSLVERR) begin
+          `uvm_warning("APB_MON", $sformatf("PSLVERR detected for addr=%h, write=%b", observed.addr, observed.write))
+        end
+        `uvm_info("APB_MON",
+                  $sformatf("\n+-----------------------------+\n\
+| Captured APB Transaction    |\n\
++-----------------------------+\n\
+| Address     : 0x%02h            |\n\
+| Data        : 0x%08h       |\n\
+| Write/Read  : %s           |\n\
++-----------------------------+",
+                            observed.addr,
+                            observed.data,
+                            (observed.write ? "WRITE" : "READ")
+                           ), UVM_MEDIUM)
+        apb_ap.write(observed);
+      end
+    end
+  endtask
+
+  // Task to monitor I2C transactions
+  task monitor_i2c();
+    forever begin
+      @(posedge i2c_vif.SCL_drive);
+      // Capture data bits
+      data_byte = {data_byte[6:0], i2c_vif.SDA_result};
+      bit_count++;
+
+      if (bit_count == 8) begin
+        waiting_for_ack = 1;
+        `uvm_info("I2C_MON", $sformatf("Captured I2C data: %h", data_byte), UVM_MEDIUM)
+      end
+      else if (bit_count == 9 && waiting_for_ack) begin
+        if (i2c_vif.SDA_result == 0)
+          `uvm_info("I2C_MON", "ACK received", UVM_MEDIUM)
+          else
+            `uvm_warning("I2C_MON", "NACK received")
+            waiting_for_ack = 0;
+        bit_count = 0;
+        data_byte = 8'h00; // Reset data byte
+      end
+    end
+  endtask
+
+  // Task to monitor and handle interrupts
+  task monitor_interrupts();
+    i2c_sr_t sr;
+    apb_seq_item observed;
+    int timeout = 0;
+    forever begin
+      @(posedge i2c_vif.Interrupt); // Trigger on interrupt assertion
+      `uvm_info("INT_MON", "Interrupt signal asserted", UVM_MEDIUM)
+
+      // Wait for a few clock cycles to ensure I2SR is updated
+      repeat (5) @(posedge apb_vif.PCLK);
+
+      // Monitor I2SR read via APB
+      @(posedge apb_vif.PCLK);
+      if (apb_vif.PSEL && apb_vif.PENABLE && apb_vif.PREADY && apb_vif.PADDR == 5'h0C && !apb_vif.PWRITE) begin
+        sr = i2c_sr_t'(apb_vif.PRDATA[7:0]); // Cast PRDATA to I2SR structure
+        observed = apb_seq_item::type_id::create("i2sr_read", this);
+        observed.addr = 5'h0C;
+        observed.write = 0;
+        observed.data = apb_vif.PRDATA;
+        apb_ap.write(observed);
+
+        // Analyze interrupt conditions
+        if (sr.IIF) begin
+          if (sr.IAL) begin
+            `uvm_error("INT_MON", "Interrupt: Arbitration Lost (IAL=1)")
+          end
+          else if (sr.RXAK) begin
+            `uvm_warning("INT_MON", "Interrupt: No ACK received (RXAK=1)")
+          end
+          else begin
+            `uvm_info("INT_MON", "Interrupt: Transfer complete (IIF=1, no errors)", UVM_MEDIUM)
+          end
+        end
+        else begin
+          `uvm_warning("INT_MON", "Interrupt asserted but IIF=0 in I2SR")
+        end
+      end
+      else begin
+        timeout++;
+        if (timeout > 100) begin
+          `uvm_error("INT_MON", "Timeout waiting for I2SR read after interrupt")
+          timeout = 0;
+        end
+      end
+    end
+  endtask
+endclass : i2c_combined_monitor
+
+//-----------------------------------------------------
+// Agent
+//-----------------------------------------------------
+
+class apb_agent extends uvm_agent;
+  apb_driver drv;
+  apb_sequencer seqr;
+  i2c_combined_monitor mon; // Use combined monitor
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  `uvm_component_utils(apb_agent)
+
+  function new(string name = "apb_agent", uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual apb_if)::get(this, "", "apb_vif", apb_vif)) begin
+      uvm_report_fatal("NOVIF", "APB virtual interface not set for agent", UVM_NONE);
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(this, "", "i2c_vif", i2c_vif)) begin
+      uvm_report_fatal("NOVIF", "I2C virtual interface not set for agent", UVM_NONE);
+    end
+    drv = apb_driver::type_id::create("drv", this);
+    mon = i2c_combined_monitor::type_id::create("mon", this);
+    seqr = apb_sequencer::type_id::create("seqr", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    drv.seq_item_port.connect(seqr.seq_item_export);
+    drv.vif = apb_vif;
+    mon.apb_vif = apb_vif; // Assign APB interface
+    mon.i2c_vif = i2c_vif; // Assign I2C interface
+  endfunction
+endclass : apb_agent
+
+
+//-----------------------------------------------------
+// Scoreboard
+//-----------------------------------------------------
+class i2c_scoreboard extends uvm_component;
+  uvm_analysis_imp#(apb_seq_item, i2c_scoreboard) apb_imp;
+  apb_seq_item expected_queue[$];
+
+  `uvm_component_utils(i2c_scoreboard)
+
+  function new(string name = "i2c_scoreboard", uvm_component parent);
+    super.new(name, parent);
+    apb_imp = new("apb_imp", this);
+  endfunction
+
+  // Add expected transaction externally
+  function void add_expected(apb_seq_item tx);
+    expected_queue.push_back(tx);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+  endfunction
+
+  function void write(apb_seq_item item);
+    apb_seq_item expected;
+
+    if (expected_queue.size() == 0) begin
+      `uvm_warning("SCOREBOARD", $sformatf("Unexpected transaction: addr=%h, data=%h, write=%b", item.addr, item.data, item.write))
+      return;
+    end
+
+    expected = expected_queue.pop_front();
+
+    if (item.addr !== expected.addr || item.data !== expected.data || item.write !== expected.write) begin
+      `uvm_error("SCOREBOARD", $sformatf("Mismatch! Got addr=%h, data=%h, write=%b | Expected addr=%h, data=%h, write=%b",
+                                         item.addr, item.data, item.write,
+                                         expected.addr, expected.data, expected.write))
+    end else begin
+      `uvm_info("SCOREBOARD", $sformatf("MATCH: addr=%h, data=%h, write=%b", item.addr, item.data, item.write), UVM_LOW)
+    end
+    $display("[SCOREBOARD] APB transaction: addr = %h, data = %h, write = %b", item.addr, item.data, item.write);
+  endfunction
+endclass : i2c_scoreboard
+
+
+//-----------------------------------------------------
+// Environment
+//-----------------------------------------------------
+class i2c_env extends uvm_env;
+  apb_agent apb_ag;
+  apb_seq_item expected_queue[$];
+  virtual apb_if apb_vif;
+  virtual i2c_if i2c_vif;
+
+  `ifdef READ_WRITE
+  i2c_scoreboard scoreboard;
+  `endif
+  `uvm_component_utils(i2c_env)
+
+  function new(string name = "i2c_env", uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    if (!uvm_config_db#(virtual apb_if)::get(this, "", "apb_vif", apb_vif)) begin
+      uvm_report_fatal("NOVIF", "APB virtual interface not set", UVM_NONE);
+    end
+    if (!uvm_config_db#(virtual i2c_if)::get(this, "", "i2c_vif", i2c_vif)) begin
+      uvm_report_fatal("NOVIF", "I2C virtual interface not set", UVM_NONE);
+    end
+
+    apb_ag = apb_agent::type_id::create("apb_ag", this);
+
+    `ifdef READ_WRITE
+    scoreboard = i2c_scoreboard::type_id::create("scoreboard", this);
+    `endif
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    apb_ag.apb_vif = apb_vif;
+    apb_ag.i2c_vif = i2c_vif;
+
+    `ifdef READ_WRITE
+    apb_ag.mon.apb_ap.connect(scoreboard.apb_imp);
+    `endif
+
+  endfunction
+endclass : i2c_env
+
+//======================================================
+// Updated i2c_test: Protect scoreboard expectations
+//======================================================
+
+class i2c_test extends uvm_test;
+  i2c_env env;
+
+  `uvm_component_utils(i2c_test)
+
+  function new(string name = "i2c_test", uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    env = i2c_env::type_id::create("env", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+
+    //Sequences Handles
+    apb_read_write_seq rw_seq;
+    apb_repeated_start_seq repeated_start_seq;
+    i2c_interrupt_seq interrupt_seq;
+    i2c_rst_seq reset_seq;
+    valid_slave_boundary_addr_seq valid_slv_addr_seq;
+
+    apb_seq_item tx;
+
+    phase.raise_objection(this);
+
+    `ifdef READ_WRITE
+    tx = apb_seq_item::type_id::create("ifdr_write");
+    tx.addr = 5'h04; tx.data = 32'h2; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("iadr_write");
+    tx.addr = 5'h00; tx.data = 32'h0000001C; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("i2cr_enable");
+    tx.addr = 5'h08; tx.data = 32'h000000C0; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("i2cr_start");
+    tx.addr = 5'h08; tx.data = 32'h000000F0; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("data_write");
+    tx.addr = 5'h10; tx.data = 32'h0000005F; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("Read_Status_reg");
+    tx.addr = 5'hC; tx.write = 0; tx.data = 'h1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("i2cr_stop");
+    tx.addr = 5'h08; tx.data = 32'h000000C0; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+
+    tx = apb_seq_item::type_id::create("i2cr_disable");
+    tx.addr = 5'h08; tx.data = 32'h00000000; tx.write = 1;
+    env.scoreboard.add_expected(tx);
+    `endif
+
+    `ifdef READ_WRITE
+    rw_seq = apb_read_write_seq::type_id::create("rw_seq");
+    rw_seq.start(env.apb_ag.seqr);
+    `elsif REPEATED_START
+    repeated_start_seq = apb_repeated_start_seq::type_id::create("repeated_start_seq");
+    repeated_start_seq.start(env.apb_ag.seqr);
+    `elsif RESET
+    reset_seq = i2c_rst_seq::type_id::create("reset_seq");
+    reset_seq.start(env.apb_ag.seqr);
+    `elsif INTERRUPT
+    interrupt_seq = i2c_interrupt_seq::type_id::create("interrupt_seq");
+    interrupt_seq.start(env.apb_ag.seqr);
+    `elsif VALID_SLAVE_ADDR
+    valid_slv_addr_seq = valid_slave_boundary_addr_seq ::type_id::create("valid_slv_addr_seq");
+    valid_slv_addr_seq.start(env.apb_ag.seqr);
+    `else
+    rw_seq = apb_read_write_seq::type_id::create("rw_seq");
+    rw_seq.start(env.apb_ag.seqr);
+    `endif
+    phase.drop_objection(this);
+  endtask
+endclass : i2c_test
+
+
+//-----------------------------------------------------
+// Top-level TB with DUT Instantiation
+//-----------------------------------------------------
+module i2c_tb;
+  apb_if apb_if_inst();
+  i2c_if i2c_if_inst();
+
+  // Clock, reset, and I2C stimulus generation
+  initial begin
+    apb_if_inst.PCLK = 0;
+    forever #5 apb_if_inst.PCLK = ~apb_if_inst.PCLK;
+  end
+
+  initial begin
+    apb_if_inst.PRESET = 1;
+    i2c_if_inst.SCL_result = 1;
+    i2c_if_inst.SDA_result = 1;
+    #20;
+    apb_if_inst.PRESET = 0;
+  end
+
+  // Simulate I2C slave ACK
+  initial begin
+    wait (i2c_if_inst.SCL_drive === 1'b1);
+    forever begin
+      repeat (8) @(posedge i2c_if_inst.SCL_drive);
+      i2c_if_inst.SDA_result = 0; // pull SDA low for ACK
+      @(posedge i2c_if_inst.SCL_drive);
+      i2c_if_inst.SDA_result = 1; // release SDA
+    end
+  end
+
+  // Dump waveforms
+  initial begin
+    $dumpfile("_group_07_i2c_dut_4.vcd");
+    $dumpvars(0, i2c_tb);
+  end
+
+  // DUT Instantiation
+  i2c dut(
+    .PCLK(apb_if_inst.PCLK), .PRESET(apb_if_inst.PRESET),
+    .PADDR(apb_if_inst.PADDR), .PSEL(apb_if_inst.PSEL), .PENABLE(apb_if_inst.PENABLE),
+    .PWRITE(apb_if_inst.PWRITE), .PWDATA(apb_if_inst.PWDATA), .PRDATA(apb_if_inst.PRDATA),
+    .PREADY(apb_if_inst.PREADY), .PSLVERR(apb_if_inst.PSLVERR),
+    .Interrupt(i2c_if_inst.Interrupt),
+    .SCL_drive(i2c_if_inst.SCL_drive), .SCL_result(i2c_if_inst.SCL_result),
+    .SDA_drive(i2c_if_inst.SDA_drive), .SDA_result(i2c_if_inst.SDA_result)
+  );
+
+  initial begin
+    uvm_config_db#(virtual apb_if)::set(null, "*", "apb_vif", apb_if_inst);
+    uvm_config_db#(virtual i2c_if)::set(null, "*", "i2c_vif", i2c_if_inst);
+    run_test("i2c_test");
+  end
+endmodule : i2c_tb
+
